@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>手势粒子 · Hand Particle</title>
+
+<!--
+  手势交互粒子动画 —— 单文件完整实现
+  ================================================
+  · 摄像头捕捉手掌，MediaPipe Hands 识别掌心坐标
+  · 手掌移动持续发射彩色粒子，跟随掌心流动
+  · 粒子半透明、色彩渐变、互相轻微吸引、缓慢飘散
+  · 深色纯黑背景 + 加法混合，粒子高亮发光
+
+  加载与性能优化：
+    · 多 CDN 容错：fastly → gcore → jsdelivr（前两者国内可直连）
+    · 摄像头授权与脚本/模型下载并行，缩短等待
+    · MediaPipe lite 模型 + 480x360 低分辨率，识别更快
+    · DPR 上限 1.5，HiDPI 屏下渲染更快更稳
+
+  运行要求：
+    需要联网 + 摄像头权限 + 安全上下文（HTTPS / localhost / 多数浏览器的 file://）。
+    若双击打开后一直无法识别，请改用本地服务器：
+      python -m http.server 8080   →  浏览器访问 http://localhost:8080
+-->
+
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  #canvas {
+    position: fixed;
+    inset: 0;
+    display: block;
+    background: #000;
+    cursor: crosshair;
+  }
+
+  #title {
+    position: fixed;
+    top: 22px;
+    left: 26px;
+    z-index: 20;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 15px;
+    letter-spacing: 2px;
+    pointer-events: none;
+  }
+  #title b {
+    font-weight: 600;
+    background: linear-gradient(90deg, #ff5f6d, #ffc371, #4facfe, #b06ab3);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  #status {
+    position: fixed;
+    top: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 16px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 13px;
+    letter-spacing: 1px;
+    pointer-events: none;
+    transition: opacity 0.4s;
+  }
+  #status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #ffb84d;
+    box-shadow: 0 0 8px currentColor;
+    flex: 0 0 auto;
+  }
+  #status.ok   .dot { background: #3ddc84; }
+  #status.hand .dot { background: #4facfe; }
+  #status.err  .dot { background: #ff5f6d; }
+
+  #hint {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 14px;
+    letter-spacing: 1px;
+    white-space: nowrap;
+    pointer-events: none;
+    transition: opacity 0.8s ease;
+  }
+  #hint.hidden { opacity: 0; }
+
+  #loading {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 22px;
+    background: rgba(0, 0, 0, 0.82);
+    transition: opacity 0.6s ease;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+  .spinner {
+    width: 46px; height: 46px;
+    border: 3px solid rgba(255, 255, 255, 0.15);
+    border-top-color: #4facfe;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loadingText {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 15px;
+    letter-spacing: 1px;
+    max-width: 80vw;
+    text-align: center;
+    line-height: 1.8;
+  }
+  #loadingText small { color: rgba(255, 255, 255, 0.45); font-size: 13px; }
+  #loadingText a { color: #6fb7ff; }
+  #loadingText code {
+    background: rgba(255,255,255,0.1);
+    padding: 1px 6px; border-radius: 4px;
+  }
+
+  #pipWrap {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 200px;
+    height: 150px;
+    z-index: 10;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 6px 30px rgba(0, 0, 0, 0.65);
+    background: #000;
+    display: none;
+  }
+  #pipWrap.show { display: block; }
+  #video {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+    transform: scaleX(-1);
+  }
+  #pip {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+  <canvas id="canvas"></canvas>
+
+  <div id="pipWrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="pip"></canvas>
+  </div>
+
+  <div id="title">🖐 <b>手势粒子</b> · Hand Particle</div>
+  <div id="status"><span class="dot"></span><span id="statusText">正在初始化…</span></div>
+  <div id="hint">🖐 将手掌对准摄像头并移动 —— 跟随掌心生成彩色粒子流光</div>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <div id="loadingText">正在加载手部识别模型…</div>
+  </div>
+
+  <!-- MediaPipe Hands 脚本改为运行时动态加载（多 CDN 节点自动容错），见下方 JS -->
+
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * 一、DOM 元素与画布初始化
+   * ============================================================ */
+  const video       = document.getElementById('video');
+  const canvas      = document.getElementById('canvas');
+  const ctx         = canvas.getContext('2d');
+  const pipCanvas   = document.getElementById('pip');
+  const pipCtx      = pipCanvas.getContext('2d');
+  const pipWrap     = document.getElementById('pipWrap');
+  const loadingEl   = document.getElementById('loading');
+  const loadingText = document.getElementById('loadingText');
+  const hintEl      = document.getElementById('hint');
+  const statusEl    = document.getElementById('status');
+  const statusText  = document.getElementById('statusText');
+
+  const PIP_W = 200, PIP_H = 150;
+
+  let W = window.innerWidth;
+  let H = window.innerHeight;
+  // DPR 上限 1.5：HiDPI 屏下减少像素填充量，显著提升粒子渲染帧率
+  const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  pipCanvas.width  = Math.floor(PIP_W * DPR);
+  pipCanvas.height = Math.floor(PIP_H * DPR);
+  pipCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  /* ============================================================
+   * 二、界面状态辅助
+   * ============================================================ */
+  function setStatus(text, type) {
+    statusText.textContent = text;
+    statusEl.classList.remove('ok', 'hand', 'err');
+    if (type) statusEl.classList.add(type);
+  }
+  function setLoading(text) { loadingText.innerHTML = text; }
+  function hideLoading()  { loadingEl.classList.add('hidden'); }
+
+  function onFatalError(html) {
+    hideLoading();
+    setStatus('摄像头不可用', 'err');
+    loadingEl.classList.remove('hidden');
+    setLoading(html +
+      '<br><br><small>粒子已切换到「鼠标按住拖动 / 触摸」模式，可继续体验。</small>');
+    setTimeout(() => loadingEl.classList.add('hidden'), 5000);
+  }
+
+  /* ============================================================
+   * 三、MediaPipe Hands 脚本加载（多 CDN 容错）
+   * ============================================================ */
+  // 国内可直连的 jsDelivr 官方备用节点；主域名 cdn.jsdelivr.net 常不稳定
+  const HANDS_VERSION = '0.4.1675469240';
+  const CDN_BASES = [
+    'https://fastly.jsdelivr.net/npm',
+    'https://gcore.jsdelivr.net/npm',
+    'https://cdn.jsdelivr.net/npm'
+  ];
+  let cdnBase = CDN_BASES[0];   // 记录成功加载的节点，供 locateFile 使用
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('脚本加载失败：' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  // 依次尝试各节点加载 hands.js，成功即记录节点并返回
+  async function loadHandsScript() {
+    for (let i = 0; i < CDN_BASES.length; i++) {
+      const base = CDN_BASES[i];
+      try {
+        await loadScript(`${base}/@mediapipe/hands@${HANDS_VERSION}/hands.js`);
+        cdnBase = base;
+        return;
+      } catch (e) { /* 尝试下一个节点 */ }
+    }
+    throw new Error('所有 CDN 节点均无法加载 MediaPipe 脚本');
+  }
+
+  /* ============================================================
+   * 四、手部识别（MediaPipe Hands）
+   * ============================================================ */
+  const TAU = Math.PI * 2;
+
+  const HAND_CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [5, 9], [9, 10], [10, 11], [11, 12],
+    [9, 13], [13, 14], [14, 15], [15, 16],
+    [13, 17], [17, 18], [18, 19], [19, 20],
+    [0, 17]
+  ];
+  const FINGERTIPS = [4, 8, 12, 16, 20];
+
+  let handActive       = false;
+  let currentLandmarks = null;
+  let fingertipPoints  = [];
+  let firstResult      = false;
+  let targetX = W / 2, targetY = H / 2;
+  const palm  = { x: W / 2, y: H / 2 };
+
+  function onResults(results) {
+    if (!firstResult) {
+      firstResult = true;
+      hideLoading();
+      setStatus('已就绪 · 请将手掌对准画面', 'ok');
+    }
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lm = results.multiHandLandmarks[0];
+      currentLandmarks = lm;
+      handActive = true;
+
+      setStatus('检测到手 👋', 'hand');
+      hintEl.classList.add('hidden');
+
+      let cx = 0, cy = 0;
+      const pts = [lm[0], lm[5], lm[9], lm[13], lm[17]];
+      for (let i = 0; i < pts.length; i++) { cx += pts[i].x; cy += pts[i].y; }
+      cx /= pts.length;
+      cy /= pts.length;
+
+      targetX = (1 - cx) * W;
+      targetY = cy * H;
+
+      fingertipPoints = [];
+      for (let i = 0; i < FINGERTIPS.length; i++) {
+        const k = FINGERTIPS[i];
+        fingertipPoints.push({ x: (1 - lm[k].x) * W, y: lm[k].y * H });
+      }
+    } else {
+      handActive = false;
+      currentLandmarks = null;
+      fingertipPoints = [];
+      if (firstResult) setStatus('未检测到手 · 请将手掌完整进入画面', 'ok');
+    }
+  }
+
+  let hands = null;
+  function initHands() {
+    hands = new Hands({
+      // WASM / 模型等资源从同一节点加载，保证版本一致
+      locateFile: (file) => `${cdnBase}/@mediapipe/hands@${HANDS_VERSION}/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 0,          // lite 模型：识别更快、跟手延迟更低
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+  }
+
+  /* ============================================================
+   * 五、摄像头（手动 getUserMedia，精确报错）
+   * ============================================================ */
+  async function startCamera() {
+    if (!window.isSecureContext) {
+      throw new Error('当前不是安全上下文，浏览器禁止使用摄像头。');
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('浏览器不支持摄像头 API。');
+    }
+
+    // 低分辨率：识别更快，粒子跟手更流畅
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 480 }, height: { ideal: 360 }, facingMode: 'user' },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    pipWrap.classList.add('show');
+
+    await new Promise((resolve, reject) => {
+      video.addEventListener('loadedmetadata', () => resolve(), { once: true });
+      video.addEventListener('error', () => reject(new Error('视频流加载失败')), { once: true });
+      video.play().catch(reject);
+    });
+
+    if (video.readyState < 2) {
+      await new Promise((resolve) => {
+        video.addEventListener('canplay', resolve, { once: true });
+      });
+    }
+  }
+
+  // 识别循环：由 rAF 驱动，sending 标志防堆积
+  let detectionReady = false;
+  let sending = false;
+  let modelFailed = false;
+
+  async function detectionTick() {
+    if (!detectionReady || sending || modelFailed) return;
+    if (video.readyState < 2) return;
+
+    sending = true;
+    try {
+      await hands.send({ image: video });
+    } catch (e) {
+      if (!modelFailed) {
+        modelFailed = true;
+        onFatalError('⚠️ 手部模型加载失败：<br><small>' +
+          (e && e.message ? e.message : e) + '</small>');
+      }
+    } finally {
+      sending = false;
+    }
+  }
+
+  /* ============================================================
+   * 六、粒子系统
+   * ============================================================ */
+  const MAX_PARTICLES = 2600;
+  const MAX_SPEED     = 14;
+  const particles     = [];
+
+  let globalHue = 0;
+  const attractor = { x: W / 2, y: H / 2, active: false };
+  let palmSpeed = 0;
+
+  const SPRITE_SIZE = 64;
+  const HUE_STEPS   = 72;
+  const glowSprites = [];
+  function buildSprites() {
+    for (let i = 0; i < HUE_STEPS; i++) {
+      const hue = (i / HUE_STEPS) * 360;
+      const s = document.createElement('canvas');
+      s.width = s.height = SPRITE_SIZE;
+      const sc = s.getContext('2d');
+      const c = SPRITE_SIZE / 2;
+      const g = sc.createRadialGradient(c, c, 0, c, c, c);
+      g.addColorStop(0.00, `hsla(${hue}, 100%, 88%, 1)`);
+      g.addColorStop(0.12, `hsla(${hue}, 100%, 68%, 0.95)`);
+      g.addColorStop(0.35, `hsla(${hue}, 100%, 58%, 0.45)`);
+      g.addColorStop(0.65, `hsla(${hue}, 100%, 52%, 0.12)`);
+      g.addColorStop(1.00, `hsla(${hue}, 100%, 50%, 0)`);
+      sc.fillStyle = g;
+      sc.fillRect(0, 0, SPRITE_SIZE, SPRITE_SIZE);
+      glowSprites.push(s);
+    }
+  }
+  buildSprites();
+
+  function spawn(x, y, opts) {
+    const angle = Math.random() * TAU;
+    const speed = (opts.speed || 1) * (0.4 + Math.random());
+    const life  = 55 + Math.random() * 75;
+    const p = {
+      x:  x + (Math.random() - 0.5) * 14,
+      y:  y + (Math.random() - 0.5) * 14,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: life,
+      maxLife: life,
+      size: 1.2 + Math.random() * 3.2,
+      hue: (globalHue + (Math.random() - 0.5) * 50 + 360) % 360,
+      sat: 85 + Math.random() * 15
+    };
+    if (particles.length >= MAX_PARTICLES) {
+      particles[(Math.random() * particles.length) | 0] = p;
+    } else {
+      particles.push(p);
+    }
+  }
+
+  function emit() {
+    const base  = 5;
+    const extra = Math.min(50, palmSpeed * 2.5);
+    const count = Math.round(base + extra);
+
+    for (let i = 0; i < count; i++) {
+      spawn(attractor.x, attractor.y, { speed: 1 + palmSpeed * 0.15 });
+    }
+    if (handActive) {
+      for (let k = 0; k < fingertipPoints.length; k++) {
+        const fp = fingertipPoints[k];
+        const n = Math.round(1 + palmSpeed * 0.4);
+        for (let i = 0; i < n; i++) spawn(fp.x, fp.y, { speed: 0.8 });
+      }
+    }
+  }
+
+  const CELL = 48;
+  const grid = new Map();
+
+  function buildGrid() {
+    grid.clear();
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const key = ((p.x / CELL) | 0) * 100000 + ((p.y / CELL) | 0);
+      let arr = grid.get(key);
+      if (!arr) { arr = []; grid.set(key, arr); }
+      arr.push(i);
+    }
+  }
+
+  function applyPairwise(p, i) {
+    const cx = (p.x / CELL) | 0;
+    const cy = (p.y / CELL) | 0;
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        const arr = grid.get(gx * 100000 + gy);
+        if (!arr) continue;
+        for (let k = 0; k < arr.length; k++) {
+          const j = arr[k];
+          if (j <= i) continue;
+          const q = particles[j];
+          const dx = q.x - p.x, dy = q.y - p.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < 1e-4 || d2 > 50 * 50) continue;
+          const d = Math.sqrt(d2);
+          const nx = dx / d, ny = dy / d;
+          let f;
+          if (d < 10) f = -0.35 * (1 - d / 10);
+          else        f = 0.012 * (d / 50);
+          p.vx += nx * f; p.vy += ny * f;
+          q.vx -= nx * f; q.vy -= ny * f;
+        }
+      }
+    }
+  }
+
+  /* ============================================================
+   * 七、物理更新
+   * ============================================================ */
+  function update() {
+    const prevAx = attractor.x, prevAy = attractor.y;
+    if (handActive) {
+      palm.x += (targetX - palm.x) * 0.35;
+      palm.y += (targetY - palm.y) * 0.35;
+      attractor.x = palm.x; attractor.y = palm.y; attractor.active = true;
+    } else if (pointerActive) {
+      attractor.x = pointer.x; attractor.y = pointer.y; attractor.active = true;
+    } else {
+      attractor.active = false;
+    }
+    palmSpeed = attractor.active
+      ? Math.hypot(attractor.x - prevAx, attractor.y - prevAy)
+      : 0;
+
+    globalHue = (globalHue + 0.5) % 360;
+
+    if (attractor.active) emit();
+
+    buildGrid();
+
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      p.life -= 1;
+      p.hue = (p.hue + 0.4) % 360;
+
+      p.vx *= 0.965;
+      p.vy *= 0.965;
+
+      if (attractor.active) {
+        const dx = attractor.x - p.x, dy = attractor.y - p.y;
+        const d = Math.sqrt(dx * dx + dy * dy) + 0.001;
+        const nx = dx / d, ny = dy / d;
+        p.vx += nx * 0.16;
+        p.vy += ny * 0.16;
+        p.vx += -ny * 0.07;
+        p.vy += nx * 0.07;
+      }
+
+      applyPairwise(p, i);
+
+      p.vx += (Math.random() - 0.5) * 0.06;
+      p.vy += (Math.random() - 0.5) * 0.06;
+
+      const sp = Math.hypot(p.vx, p.vy);
+      if (sp > MAX_SPEED) { p.vx = p.vx / sp * MAX_SPEED; p.vy = p.vy / sp * MAX_SPEED; }
+
+      p.x += p.vx;
+      p.y += p.vy;
+
+      if (p.x < 0) p.x += W; else if (p.x > W) p.x -= W;
+      if (p.y < 0) p.y += H; else if (p.y > H) p.y -= H;
+    }
+
+    let w = 0;
+    for (let r = 0; r < particles.length; r++) {
+      if (particles[r].life > 0) particles[w++] = particles[r];
+    }
+    particles.length = w;
+  }
+
+  /* ============================================================
+   * 八、渲染
+   * ============================================================ */
+  function render() {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const a = p.life / p.maxLife;
+      const spr = glowSprites[(p.hue / (360 / HUE_STEPS)) | 0];
+      const r = p.size * (0.6 + a * 5.5);
+      ctx.globalAlpha = a * 0.85;
+      ctx.drawImage(spr, p.x - r, p.y - r, r * 2, r * 2);
+    }
+    ctx.globalAlpha = 1;
+
+    if (attractor.active) {
+      const spr = glowSprites[(globalHue / (360 / HUE_STEPS)) | 0];
+      ctx.globalAlpha = 0.5;
+      ctx.drawImage(spr, attractor.x - 32, attractor.y - 32, 64, 64);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawPip() {
+    pipCtx.clearRect(0, 0, PIP_W, PIP_H);
+    if (!currentLandmarks) return;
+
+    pipCtx.lineWidth = 2;
+    pipCtx.strokeStyle = 'rgba(0, 230, 190, 0.85)';
+    pipCtx.beginPath();
+    for (let i = 0; i < HAND_CONNECTIONS.length; i++) {
+      const a = currentLandmarks[HAND_CONNECTIONS[i][0]];
+      const b = currentLandmarks[HAND_CONNECTIONS[i][1]];
+      pipCtx.moveTo((1 - a.x) * PIP_W, a.y * PIP_H);
+      pipCtx.lineTo((1 - b.x) * PIP_W, b.y * PIP_H);
+    }
+    pipCtx.stroke();
+
+    pipCtx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    for (let i = 0; i < currentLandmarks.length; i++) {
+      const lm = currentLandmarks[i];
+      pipCtx.beginPath();
+      pipCtx.arc((1 - lm.x) * PIP_W, lm.y * PIP_H, 3, 0, TAU);
+      pipCtx.fill();
+    }
+  }
+
+  /* ============================================================
+   * 九、鼠标 / 触摸备用交互
+   * ============================================================ */
+  const pointer = { x: W / 2, y: H / 2 };
+  let pointerActive = false;
+
+  window.addEventListener('pointerdown', (e) => {
+    pointer.x = e.clientX; pointer.y = e.clientY;
+    pointerActive = true;
+  });
+  window.addEventListener('pointermove', (e) => {
+    if (pointerActive) { pointer.x = e.clientX; pointer.y = e.clientY; }
+  });
+  window.addEventListener('pointerup',    () => { pointerActive = false; });
+  window.addEventListener('pointerleave', () => { pointerActive = false; });
+
+  /* ============================================================
+   * 十、主循环 + 看门狗 + 启动
+   * ============================================================ */
+  let watchdogStart = 0;
+
+  function loop() {
+    if (!firstResult && watchdogStart && performance.now() - watchdogStart > 30000) {
+      onFatalError(
+        '⚠️ 手部模型加载超时。<br><small>可能原因：网络较慢 / 防火墙拦截 CDN，或浏览器未真正启用摄像头。</small>' +
+        '<br><small>建议：改用本地服务器打开 —— 命令行执行 <code>python -m http.server 8080</code>，' +
+        '再访问 <code>http://localhost:8080</code>。</small>');
+      watchdogStart = 0;
+    }
+
+    detectionTick();
+    update();
+    render();
+    drawPip();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function cameraError(e) {
+    let msg;
+    if (e && e.name === 'NotAllowedError') {
+      msg = '⚠️ 摄像头权限被拒绝。<br><small>请点击浏览器地址栏的摄像头图标，允许访问后刷新。</small>';
+    } else if (e && e.name === 'NotFoundError') {
+      msg = '⚠️ 未找到摄像头设备。<br><small>请检查摄像头是否已连接/被其他程序占用。</small>';
+    } else if (e && e.name === 'NotReadableError') {
+      msg = '⚠️ 摄像头被其他程序占用。<br><small>请关闭占用摄像头的应用后刷新。</small>';
+    } else {
+      msg = '⚠️ 摄像头启动失败：<br><small>' + (e && e.message ? e.message : e) +
+            '</small><br><br><small>提示：若通过 file:// 打开无法使用摄像头，请改用本地服务器访问：<br>' +
+            '<code>python -m http.server 8080</code> → <a href="http://localhost:8080">http://localhost:8080</a></small>';
+    }
+    onFatalError(msg);
+  }
+
+  window.addEventListener('load', () => { bootstrap(); });
+
+  async function bootstrap() {
+    // 并行：立即请求摄像头权限（授权框尽早弹出），与脚本/模型下载同时进行
+    const camReady = startCamera();
+    camReady.catch(() => {}); // 先吞掉错误，稍后统一处理
+
+    try {
+      setStatus('正在加载 MediaPipe 脚本…');
+      await loadHandsScript();
+      initHands();
+      detectionReady = true;      // 摄像头就绪后立刻开始识别
+      watchdogStart = performance.now();
+    } catch (e) {
+      onFatalError('⚠️ ' + (e && e.message ? e.message : e) +
+        '<br><small>请检查网络连接后刷新页面。</small>');
+      return;
+    }
+
+    try {
+      setStatus('正在连接摄像头…');
+      await camReady;
+      setStatus('模型加载中，请稍候…');
+    } catch (e) {
+      cameraError(e);
+    }
+  }
+})();
+</script>
+</body>
+</html>
